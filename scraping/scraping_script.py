@@ -79,4 +79,35 @@ def classify_type(instruction_text: str) -> str:
         if re.search(pattern, t):
             return label
     return "Unclassified"
+
+
+# ----------------------------------------------------------------------
+# 4. Walk entry-content, split into passages, then into question-groups
+# ----------------------------------------------------------------------
+QRANGE_RE = re.compile(r"Questions?\s+(\d{1,3})\s*(?:-|–|to)\s*(\d{1,3})", re.I)
+ 
+ 
+def get_passage_title(node):
+    """A passage title is a centered/capitalised <p><strong>...</strong></p>
+    with an id starting 'mcetoc'."""
+    strong = node.find("strong")
+    return strong.get_text(strip=True) if strong else node.get_text(strip=True)
+ 
+ 
+def extract_statements_by_number(text: str, numbers):
+    """
+    For blocks where each question is literally 'N. text' or 'N text'
+    separated by <br/> (already converted to \n), grab the statement
+    text for each number in `numbers`.
+    """
+    out = {}
+    lines = text.split("\n")
+    for line in lines:
+        line = line.strip()
+        m = re.match(r"^(\d{1,3})[\.\)]?\s+(.*\S)\s*$", line)
+        if m:
+            n = int(m.group(1))
+            if n in numbers:
+                out[n] = m.group(2).strip()
+    return out
  
