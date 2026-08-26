@@ -1,23 +1,23 @@
 """
 IELTS Reading Test scraper for practicepteonline.com style pages.
- 
+
 Extracts rows shaped like:
     exam_category, passage, question_type, question_number, question, answer
- 
+
 Works off two things in the page:
   1. <div class="entry-content"> ... </div>          -> all passages + questions
   2. <div id="bg-showmore-hidden-...">1. x<br/>2. y...</div>  -> the answer key
- 
-Usage:
-    python ielts_scraper.py path/to/page.html output.csv
-    python ielts_scraper.py https://practicepteonline.com/ielts-reading-test-62/ output.csv
-"""
 
+Usage:
+    python scraping_script.py path/to/page.html output.csv
+    python scraping_script.py https://practicepteonline.com/ielts-reading-test-62/ output.csv
+"""
 import re
 import sys
 import csv
 import json
 from bs4 import BeautifulSoup, NavigableString
+
 
 # ----------------------------------------------------------------------
 # 1. Load HTML (local file or URL)
@@ -40,11 +40,11 @@ def extract_answer_key(soup: BeautifulSoup) -> dict:
     answer_div = soup.find("div", id=re.compile(r"^bg-showmore-hidden-"))
     if not answer_div:
         return {}
- 
+
     # br tags act as line separators; convert them to \n before extracting text
     for br in answer_div.find_all("br"):
         br.replace_with("\n")
- 
+
     raw_text = answer_div.get_text()
     answers = {}
     # matches lines like "12. C" or "29. timber and stone"
@@ -53,8 +53,8 @@ def extract_answer_key(soup: BeautifulSoup) -> dict:
         ans = m.group(2).strip()
         answers[num] = ans
     return answers
- 
- 
+
+
 # ----------------------------------------------------------------------
 # 3. Classify a question-group instruction paragraph into a type label
 # ----------------------------------------------------------------------
@@ -85,15 +85,15 @@ def classify_type(instruction_text: str) -> str:
 # 4. Walk entry-content, split into passages, then into question-groups
 # ----------------------------------------------------------------------
 QRANGE_RE = re.compile(r"Questions?\s+(\d{1,3})\s*(?:-|–|to)\s*(\d{1,3})", re.I)
- 
- 
+
+
 def get_passage_title(node):
     """A passage title is a centered/capitalised <p><strong>...</strong></p>
     with an id starting 'mcetoc'."""
     strong = node.find("strong")
     return strong.get_text(strip=True) if strong else node.get_text(strip=True)
- 
- 
+
+
 def extract_statements_by_number(text: str, numbers):
     """
     For blocks where each question is literally 'N. text' or 'N text'
@@ -111,45 +111,55 @@ def extract_statements_by_number(text: str, numbers):
                 out[n] = m.group(2).strip()
     return out
 
+
 def parse_ielts_page(html: str, exam_category_hint: str = None):
     soup = BeautifulSoup(html, "lxml")
- 
+
     title_tag = soup.find("h1", class_=re.compile("page-title"))
     exam_category = exam_category_hint or (
         title_tag.get_text(strip=True) if title_tag else "Unknown Test"
     )
- 
+
     answer_key = extract_answer_key(soup)
- 
+
     entry = soup.find("div", class_="entry-content")
     if not entry:
         return []
- 
+
     rows = []
- 
+
     # Collect ordered list of relevant nodes: passage-title markers,
     # "Questions X-Y" markers, and everything else as body text.
     children = [c for c in entry.find_all(["p", "figure"], recursive=False)]
- 
+
     current_passage = None
     current_group = None  # dict: start,end,type_text,body_lines
     groups = []
- 
+
+    # passage_title -> ordered list of paragraph texts that make up the
+    # actual reading passage (i.e. everything before its first
+    # "Questions X-Y" header).
+    passage_texts = {}
+    collecting_passage = False
+
     for node in children:
         node_text = node.get_text(" ", strip=True)
- 
+
         # --- Passage title marker ---
         p_id = node.get("id", "")
         if p_id.startswith("mcetoc"):
             current_passage = get_passage_title(node)
+            passage_texts.setdefault(current_passage, [])
+            collecting_passage = True
             continue
- 
+
         if not node_text:
             continue
- 
+
         # --- New question-range header ---
         range_match = QRANGE_RE.search(node_text)
         if range_match and node.find("strong"):
+            collecting_passage = False  # passage body ends at first Q header
             if current_group:
                 groups.append(current_group)
             start, end = int(range_match.group(1)), int(range_match.group(2))
@@ -161,13 +171,22 @@ def parse_ielts_page(html: str, exam_category_hint: str = None):
                 "body_nodes": [],
             }
             continue
- 
+
+        if collecting_passage and current_passage is not None:
+            # Skip obvious meta lines (ad captions, empty strong-only bits)
+            passage_texts[current_passage].append(node_text)
+            continue
+
         if current_group is not None:
             current_group["body_nodes"].append(node)
- 
+
     if current_group:
         groups.append(current_group)
- 
+
+    passage_full_text = {
+        title: "\n\n".join(paras) for title, paras in passage_texts.items()
+    }
+
     # --- For each group, build per-question rows ---
     for g in groups:
         # Classification should look at the header line PLUS the next
@@ -179,7 +198,7 @@ def parse_ielts_page(html: str, exam_category_hint: str = None):
         )
         qtype = classify_type(classify_source)
         numbers = list(range(g["start"], g["end"] + 1))
- 
+
         # Convert body nodes to a newline-joined text (br -> \n) for
         # line-based statement extraction (works for MCQ/matching/Y-N-NG).
         joined_html_text_parts = []
@@ -189,47 +208,101 @@ def parse_ielts_page(html: str, exam_category_hint: str = None):
                 br.replace_with("\n")
             joined_html_text_parts.append(n_copy.get_text())
         joined_text = "\n".join(joined_html_text_parts)
- 
+
         per_question_text = extract_statements_by_number(joined_text, set(numbers))
- 
+
         # Fallback question text: use the group's instruction sentence,
         # since fill-in-the-blank (summary/table) questions don't have
         # a clean standalone "question" string.
         fallback_text = g["instruction"]
- 
+
         for num in numbers:
             question_text = per_question_text.get(num, fallback_text)
             rows.append({
                 "exam_category": exam_category,
                 "passage": g["passage"] or "",
+                "passage_text": passage_full_text.get(g["passage"], ""),
                 "question_type": qtype,
                 "question_number": num,
                 "question": question_text,
                 "answer": answer_key.get(num, ""),
             })
- 
-    return rows
- 
- 
+
+    return rows, passage_full_text
+
+
 # ----------------------------------------------------------------------
-# 5. CLI
+# 5. Training-ready JSONL: one record per passage, with all its
+#    questions bundled together (passage -> Q&A set), which is the
+#    shape you want for fine-tuning a model to generate IELTS
+#    questions from a passage.
+# ----------------------------------------------------------------------
+def build_training_records(rows, exam_category, passage_full_text):
+    by_passage = {}
+    for r in rows:
+        by_passage.setdefault(r["passage"], []).append(r)
+
+    records = []
+    for passage, qrows in by_passage.items():
+        qrows_sorted = sorted(qrows, key=lambda r: r["question_number"])
+        # group consecutive rows of the same question_type into blocks,
+        # matching how IELTS actually presents them (e.g. "Questions 16-22")
+        blocks = []
+        cur_type, cur_qs = None, []
+        for r in qrows_sorted:
+            if r["question_type"] != cur_type:
+                if cur_qs:
+                    blocks.append({"question_type": cur_type, "questions": cur_qs})
+                cur_type, cur_qs = r["question_type"], []
+            cur_qs.append({
+                "number": r["question_number"],
+                "question": r["question"],
+                "answer": r["answer"],
+            })
+        if cur_qs:
+            blocks.append({"question_type": cur_type, "questions": cur_qs})
+
+        records.append({
+            "exam_category": exam_category,
+            "passage_title": passage,
+            "passage_text": passage_full_text.get(passage, ""),
+            "question_blocks": blocks,
+        })
+    return records
+
+
+# ----------------------------------------------------------------------
+# 6. CLI
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python ielts_scraper.py <html_file_or_url> <output.csv>")
+        print("Usage: python ielts_scraper.py <html_file_or_url> <output_basename>")
+        print("  writes <output_basename>.csv  (flat, one row per question)")
+        print("  writes <output_basename>.jsonl (grouped by passage, for fine-tuning)")
         sys.exit(1)
- 
-    src, out_path = sys.argv[1], sys.argv[2]
+
+    src, out_base = sys.argv[1], sys.argv[2]
+    out_base = re.sub(r"\.(csv|jsonl)$", "", out_base)
+
     html = load_html(src)
-    rows = parse_ielts_page(html)
- 
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
+    rows, passage_full_text = parse_ielts_page(html)
+    exam_category = rows[0]["exam_category"] if rows else "Unknown Test"
+
+    csv_path = f"{out_base}.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["exam_category", "passage", "question_type",
-                        "question_number", "question", "answer"],
+            fieldnames=["exam_category", "passage", "passage_text",
+                        "question_type", "question_number", "question", "answer"],
         )
         writer.writeheader()
         writer.writerows(rows)
- 
-    print(f"Wrote {len(rows)} rows to {out_path}")
+
+    jsonl_path = f"{out_base}.jsonl"
+    records = build_training_records(rows, exam_category, passage_full_text)
+    with open(jsonl_path, "w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    print(f"Wrote {len(rows)} rows to {csv_path}")
+    print(f"Wrote {len(records)} passage records to {jsonl_path}")
