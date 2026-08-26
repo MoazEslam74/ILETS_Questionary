@@ -110,4 +110,126 @@ def extract_statements_by_number(text: str, numbers):
             if n in numbers:
                 out[n] = m.group(2).strip()
     return out
+
+def parse_ielts_page(html: str, exam_category_hint: str = None):
+    soup = BeautifulSoup(html, "lxml")
  
+    title_tag = soup.find("h1", class_=re.compile("page-title"))
+    exam_category = exam_category_hint or (
+        title_tag.get_text(strip=True) if title_tag else "Unknown Test"
+    )
+ 
+    answer_key = extract_answer_key(soup)
+ 
+    entry = soup.find("div", class_="entry-content")
+    if not entry:
+        return []
+ 
+    rows = []
+ 
+    # Collect ordered list of relevant nodes: passage-title markers,
+    # "Questions X-Y" markers, and everything else as body text.
+    children = [c for c in entry.find_all(["p", "figure"], recursive=False)]
+ 
+    current_passage = None
+    current_group = None  # dict: start,end,type_text,body_lines
+    groups = []
+ 
+    for node in children:
+        node_text = node.get_text(" ", strip=True)
+ 
+        # --- Passage title marker ---
+        p_id = node.get("id", "")
+        if p_id.startswith("mcetoc"):
+            current_passage = get_passage_title(node)
+            continue
+ 
+        if not node_text:
+            continue
+ 
+        # --- New question-range header ---
+        range_match = QRANGE_RE.search(node_text)
+        if range_match and node.find("strong"):
+            if current_group:
+                groups.append(current_group)
+            start, end = int(range_match.group(1)), int(range_match.group(2))
+            current_group = {
+                "passage": current_passage,
+                "start": start,
+                "end": end,
+                "instruction": node_text,
+                "body_nodes": [],
+            }
+            continue
+ 
+        if current_group is not None:
+            current_group["body_nodes"].append(node)
+ 
+    if current_group:
+        groups.append(current_group)
+ 
+    # --- For each group, build per-question rows ---
+    for g in groups:
+        # Classification should look at the header line PLUS the next
+        # couple of body paragraphs, since instructions ("Do the
+        # following statements agree...", "Complete the table...")
+        # often live in a separate <p> right after "Questions X-Y".
+        classify_source = g["instruction"] + " " + " ".join(
+            n.get_text(" ", strip=True) for n in g["body_nodes"][:2]
+        )
+        qtype = classify_type(classify_source)
+        numbers = list(range(g["start"], g["end"] + 1))
+ 
+        # Convert body nodes to a newline-joined text (br -> \n) for
+        # line-based statement extraction (works for MCQ/matching/Y-N-NG).
+        joined_html_text_parts = []
+        for n in g["body_nodes"]:
+            n_copy = BeautifulSoup(str(n), "lxml")
+            for br in n_copy.find_all("br"):
+                br.replace_with("\n")
+            joined_html_text_parts.append(n_copy.get_text())
+        joined_text = "\n".join(joined_html_text_parts)
+ 
+        per_question_text = extract_statements_by_number(joined_text, set(numbers))
+ 
+        # Fallback question text: use the group's instruction sentence,
+        # since fill-in-the-blank (summary/table) questions don't have
+        # a clean standalone "question" string.
+        fallback_text = g["instruction"]
+ 
+        for num in numbers:
+            question_text = per_question_text.get(num, fallback_text)
+            rows.append({
+                "exam_category": exam_category,
+                "passage": g["passage"] or "",
+                "question_type": qtype,
+                "question_number": num,
+                "question": question_text,
+                "answer": answer_key.get(num, ""),
+            })
+ 
+    return rows
+ 
+ 
+# ----------------------------------------------------------------------
+# 5. CLI
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        print("Usage: python ielts_scraper.py <html_file_or_url> <output.csv>")
+        sys.exit(1)
+ 
+    src, out_path = sys.argv[1], sys.argv[2]
+    html = load_html(src)
+    rows = parse_ielts_page(html)
+ 
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["exam_category", "passage", "question_type",
+                        "question_number", "question", "answer"],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+ 
+    print(f"Wrote {len(rows)} rows to {out_path}")
