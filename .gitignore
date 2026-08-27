@@ -1,2 +1,4 @@
 #output CSV data
 *.csv
+*.jsonl
+*.json

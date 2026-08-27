@@ -31,8 +31,8 @@ def load_html(source: str) -> str:
         return resp.text
     with open(source, "r", encoding="utf-8", errors="ignore") as f:
         return f.read()
-
-
+ 
+ 
 # ----------------------------------------------------------------------
 # 2. Pull the answer key: {question_number(int): answer_text(str)}
 # ----------------------------------------------------------------------
@@ -40,11 +40,11 @@ def extract_answer_key(soup: BeautifulSoup) -> dict:
     answer_div = soup.find("div", id=re.compile(r"^bg-showmore-hidden-"))
     if not answer_div:
         return {}
-
+ 
     # br tags act as line separators; convert them to \n before extracting text
     for br in answer_div.find_all("br"):
         br.replace_with("\n")
-
+ 
     raw_text = answer_div.get_text()
     answers = {}
     # matches lines like "12. C" or "29. timber and stone"
@@ -53,8 +53,8 @@ def extract_answer_key(soup: BeautifulSoup) -> dict:
         ans = m.group(2).strip()
         answers[num] = ans
     return answers
-
-
+ 
+ 
 # ----------------------------------------------------------------------
 # 3. Classify a question-group instruction paragraph into a type label
 # ----------------------------------------------------------------------
@@ -71,29 +71,29 @@ TYPE_RULES = [
     (r"choose the correct heading", "Matching Headings"),
     (r"no more than \w+ words?", "Short Answer / Completion"),
 ]
-
-
+ 
+ 
 def classify_type(instruction_text: str) -> str:
     t = instruction_text.lower()
     for pattern, label in TYPE_RULES:
         if re.search(pattern, t):
             return label
     return "Unclassified"
-
-
+ 
+ 
 # ----------------------------------------------------------------------
 # 4. Walk entry-content, split into passages, then into question-groups
 # ----------------------------------------------------------------------
 QRANGE_RE = re.compile(r"Questions?\s+(\d{1,3})\s*(?:-|–|to)\s*(\d{1,3})", re.I)
-
-
+ 
+ 
 def get_passage_title(node):
     """A passage title is a centered/capitalised <p><strong>...</strong></p>
     with an id starting 'mcetoc'."""
     strong = node.find("strong")
     return strong.get_text(strip=True) if strong else node.get_text(strip=True)
-
-
+ 
+ 
 def extract_statements_by_number(text: str, numbers):
     """
     For blocks where each question is literally 'N. text' or 'N text'
@@ -110,41 +110,131 @@ def extract_statements_by_number(text: str, numbers):
             if n in numbers:
                 out[n] = m.group(2).strip()
     return out
-
-
+ 
+ 
+# ----------------------------------------------------------------------
+# 4b. Lettered-option (choice) extraction — handles all 3 HTML shapes:
+#     - per-question inline options   (Q23-25: "23 stem<br><b>A</b> opt...")
+#     - shared legend, one <p> each   (Q9-15:  separate <p><b>A</b> opt</p>)
+#     - shared legend, one <p> total  (Q26-28: "<b>A</b> opt<br><b>B</b> opt")
+#     - table-based matching          (Q36-40: <td> of lettered options)
+# ----------------------------------------------------------------------
+LETTER_RE = re.compile(r"^[A-H]$")
+LEADING_NUM_RE = re.compile(r"^(\d{1,3})[\.\)]?\s*(.*)$")
+ 
+ 
+def tokenize_node(node):
+    """Flat (kind, text) tokens for a node's direct children:
+    kind in {'text','strong','br'}."""
+    tokens = []
+    for child in getattr(node, "children", []):
+        if isinstance(child, NavigableString):
+            t = str(child)
+            if t.strip():
+                tokens.append(("text", t))
+        elif getattr(child, "name", None) == "br":
+            tokens.append(("br", ""))
+        elif getattr(child, "name", None) == "strong":
+            tokens.append(("strong", child.get_text()))
+        else:
+            t = child.get_text()
+            if t.strip():
+                tokens.append(("text", t))
+    return tokens
+ 
+ 
+def split_lettered_options(tokens):
+    """
+    Given a token stream, split into (leading_text, {letter: option_text}).
+    leading_text is whatever came before the first lettered <strong>
+    (e.g. a question stem, or empty for a pure legend paragraph).
+    """
+    leading_parts, options = [], {}
+    current_letter, cur_parts = None, []
+    for kind, val in tokens:
+        if kind == "strong" and LETTER_RE.match(val.strip()):
+            if current_letter:
+                options[current_letter] = " ".join(
+                    p.strip() for p in cur_parts if p.strip()
+                )
+            current_letter = val.strip()
+            cur_parts = []
+        elif kind == "br":
+            continue
+        else:
+            (cur_parts if current_letter else leading_parts).append(val)
+    if current_letter:
+        options[current_letter] = " ".join(p.strip() for p in cur_parts if p.strip())
+    leading_text = " ".join(p.strip() for p in leading_parts if p.strip())
+    return leading_text, options
+ 
+ 
+def extract_options_from_nodes(nodes, numbers):
+    """
+    Scan a list of <p>/<figure> nodes and return:
+      per_question_options: {question_number: {letter: text}}
+      shared_options:        {letter: text}   (one legend for the whole group)
+    A paragraph whose leading text starts with a question number in
+    `numbers` contributes its options to that question specifically;
+    anything else (standalone legend paragraphs, or a table's option
+    column) is treated as a shared legend for the whole group.
+    """
+    per_question_options = {}
+    shared_options = {}
+ 
+    def process_tokens(tokens):
+        leading_text, options = split_lettered_options(tokens)
+        if not options:
+            return
+        m = LEADING_NUM_RE.match(leading_text) if leading_text else None
+        if m and int(m.group(1)) in numbers:
+            per_question_options[int(m.group(1))] = options
+        else:
+            shared_options.update(options)
+ 
+    for node in nodes:
+        if getattr(node, "name", None) == "figure":
+            for td in node.find_all("td"):
+                process_tokens(tokenize_node(td))
+            continue
+        process_tokens(tokenize_node(node))
+ 
+    return per_question_options, shared_options
+ 
+ 
 def parse_ielts_page(html: str, exam_category_hint: str = None):
     soup = BeautifulSoup(html, "lxml")
-
+ 
     title_tag = soup.find("h1", class_=re.compile("page-title"))
     exam_category = exam_category_hint or (
         title_tag.get_text(strip=True) if title_tag else "Unknown Test"
     )
-
+ 
     answer_key = extract_answer_key(soup)
-
+ 
     entry = soup.find("div", class_="entry-content")
     if not entry:
         return []
-
+ 
     rows = []
-
+ 
     # Collect ordered list of relevant nodes: passage-title markers,
     # "Questions X-Y" markers, and everything else as body text.
     children = [c for c in entry.find_all(["p", "figure"], recursive=False)]
-
+ 
     current_passage = None
     current_group = None  # dict: start,end,type_text,body_lines
     groups = []
-
+ 
     # passage_title -> ordered list of paragraph texts that make up the
     # actual reading passage (i.e. everything before its first
     # "Questions X-Y" header).
     passage_texts = {}
     collecting_passage = False
-
+ 
     for node in children:
         node_text = node.get_text(" ", strip=True)
-
+ 
         # --- Passage title marker ---
         p_id = node.get("id", "")
         if p_id.startswith("mcetoc"):
@@ -152,10 +242,10 @@ def parse_ielts_page(html: str, exam_category_hint: str = None):
             passage_texts.setdefault(current_passage, [])
             collecting_passage = True
             continue
-
+ 
         if not node_text:
             continue
-
+ 
         # --- New question-range header ---
         range_match = QRANGE_RE.search(node_text)
         if range_match and node.find("strong"):
@@ -171,22 +261,22 @@ def parse_ielts_page(html: str, exam_category_hint: str = None):
                 "body_nodes": [],
             }
             continue
-
+ 
         if collecting_passage and current_passage is not None:
             # Skip obvious meta lines (ad captions, empty strong-only bits)
             passage_texts[current_passage].append(node_text)
             continue
-
+ 
         if current_group is not None:
             current_group["body_nodes"].append(node)
-
+ 
     if current_group:
         groups.append(current_group)
-
+ 
     passage_full_text = {
         title: "\n\n".join(paras) for title, paras in passage_texts.items()
     }
-
+ 
     # --- For each group, build per-question rows ---
     for g in groups:
         # Classification should look at the header line PLUS the next
@@ -198,26 +288,49 @@ def parse_ielts_page(html: str, exam_category_hint: str = None):
         )
         qtype = classify_type(classify_source)
         numbers = list(range(g["start"], g["end"] + 1))
-
+ 
         # Convert body nodes to a newline-joined text (br -> \n) for
         # line-based statement extraction (works for MCQ/matching/Y-N-NG).
+        # Table cells are split apart first so two side-by-side <td>s
+        # (e.g. causes | effects) don't run together into one line.
         joined_html_text_parts = []
         for n in g["body_nodes"]:
+            if getattr(n, "name", None) == "figure":
+                for td in n.find_all("td"):
+                    td_copy = BeautifulSoup(str(td), "lxml")
+                    for br in td_copy.find_all("br"):
+                        br.replace_with("\n")
+                    joined_html_text_parts.append(td_copy.get_text())
+                continue
             n_copy = BeautifulSoup(str(n), "lxml")
             for br in n_copy.find_all("br"):
                 br.replace_with("\n")
             joined_html_text_parts.append(n_copy.get_text())
         joined_text = "\n".join(joined_html_text_parts)
-
+ 
         per_question_text = extract_statements_by_number(joined_text, set(numbers))
-
+        per_question_options, shared_options = extract_options_from_nodes(
+            g["body_nodes"], set(numbers)
+        )
+ 
         # Fallback question text: use the group's instruction sentence,
         # since fill-in-the-blank (summary/table) questions don't have
         # a clean standalone "question" string.
         fallback_text = g["instruction"]
-
+ 
         for num in numbers:
             question_text = per_question_text.get(num, fallback_text)
+            raw_answer = answer_key.get(num, "")
+ 
+            # Resolve a lettered answer (A, B, C...) to its real text,
+            # preferring per-question options over the group's shared
+            # legend. Non-letter answers (yes/no, words, phrases) pass
+            # through unchanged.
+            options = per_question_options.get(num) or shared_options or {}
+            resolved_answer = raw_answer
+            if LETTER_RE.match(raw_answer.strip()) and raw_answer.strip() in options:
+                resolved_answer = options[raw_answer.strip()]
+ 
             rows.append({
                 "exam_category": exam_category,
                 "passage": g["passage"] or "",
@@ -225,12 +338,14 @@ def parse_ielts_page(html: str, exam_category_hint: str = None):
                 "question_type": qtype,
                 "question_number": num,
                 "question": question_text,
-                "answer": answer_key.get(num, ""),
+                "choices": json.dumps(options, ensure_ascii=False) if options else "",
+                "answer_letter": raw_answer if LETTER_RE.match(raw_answer.strip()) else "",
+                "answer": resolved_answer,
             })
-
+ 
     return rows, passage_full_text
-
-
+ 
+ 
 # ----------------------------------------------------------------------
 # 5. Training-ready JSONL: one record per passage, with all its
 #    questions bundled together (passage -> Q&A set), which is the
@@ -241,7 +356,7 @@ def build_training_records(rows, exam_category, passage_full_text):
     by_passage = {}
     for r in rows:
         by_passage.setdefault(r["passage"], []).append(r)
-
+ 
     records = []
     for passage, qrows in by_passage.items():
         qrows_sorted = sorted(qrows, key=lambda r: r["question_number"])
@@ -257,11 +372,12 @@ def build_training_records(rows, exam_category, passage_full_text):
             cur_qs.append({
                 "number": r["question_number"],
                 "question": r["question"],
+                "choices": json.loads(r["choices"]) if r["choices"] else None,
                 "answer": r["answer"],
             })
         if cur_qs:
             blocks.append({"question_type": cur_type, "questions": cur_qs})
-
+ 
         records.append({
             "exam_category": exam_category,
             "passage_title": passage,
@@ -269,8 +385,8 @@ def build_training_records(rows, exam_category, passage_full_text):
             "question_blocks": blocks,
         })
     return records
-
-
+ 
+ 
 # ----------------------------------------------------------------------
 # 6. CLI
 # ----------------------------------------------------------------------
@@ -280,29 +396,31 @@ if __name__ == "__main__":
         print("  writes <output_basename>.csv  (flat, one row per question)")
         print("  writes <output_basename>.jsonl (grouped by passage, for fine-tuning)")
         sys.exit(1)
-
+ 
     src, out_base = sys.argv[1], sys.argv[2]
     out_base = re.sub(r"\.(csv|jsonl)$", "", out_base)
-
+ 
     html = load_html(src)
     rows, passage_full_text = parse_ielts_page(html)
     exam_category = rows[0]["exam_category"] if rows else "Unknown Test"
-
+ 
     csv_path = f"{out_base}.csv"
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
             f,
             fieldnames=["exam_category", "passage", "passage_text",
-                        "question_type", "question_number", "question", "answer"],
+                        "question_type", "question_number", "question",
+                        "choices", "answer_letter", "answer"],
         )
         writer.writeheader()
         writer.writerows(rows)
-
+ 
     jsonl_path = f"{out_base}.jsonl"
     records = build_training_records(rows, exam_category, passage_full_text)
     with open(jsonl_path, "w", encoding="utf-8") as f:
         for rec in records:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
+ 
     print(f"Wrote {len(rows)} rows to {csv_path}")
     print(f"Wrote {len(records)} passage records to {jsonl_path}")
+ 
